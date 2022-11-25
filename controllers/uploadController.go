@@ -7,6 +7,9 @@ import (
 	"example/go-api/lib"
 	"example/go-api/service"
 	"fmt"
+	"image"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"log"
 	"mime/multipart"
@@ -14,8 +17,10 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/chai2010/webp"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/nfnt/resize"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -72,7 +77,7 @@ func (u *uploadController) Config() UploadConfig {
 		FieldName:        "file",
 		BucketFolder:     "",
 		Extensions:       []Extension{JPEGFile, PNGFile, JPGFile},
-		ThumbnailEnabled: false,
+		ThumbnailEnabled: true,
 		ThumbnailWidth:   100,
 		Multiple:         false,
 	}
@@ -90,6 +95,7 @@ func NewUploadController(jwtService service.JWTService, bucketService service.Bu
 			ThumbnailEnabled: false,
 			ThumbnailWidth:   100,
 			Multiple:         false,
+			WebpEnabled:      true,
 		},
 	}
 }
@@ -175,9 +181,12 @@ func (controller uploadController) uploadFile(
 	if err != nil {
 		return err
 	}
-	fileReader := bytes.NewReader(fileByte)
+
 	uploadFileName, fileUID := controller.randomFileName(conf, ext)
+
+	//OriginalImage
 	errGroup.Go(func() error {
+		fileReader := bytes.NewReader(fileByte)
 		urlResponse, err := controller.bucket.UploadFile(ctx, fileReader, uploadFileName, fileHeader.Filename)
 		*uploadedFiles = append(*uploadedFiles, lib.UploadMetadata{
 			FieldName: conf.FieldName,
@@ -188,7 +197,97 @@ func (controller uploadController) uploadFile(
 		})
 		return err
 	})
+
+	//WebPImage
+	if conf.WebpEnabled {
+		OriginalWebpReader := bytes.NewReader(fileByte)
+		errGroup.Go(func() error {
+			var webpBuf bytes.Buffer
+			img, err := controller.getImage(OriginalWebpReader, ext)
+			if err != nil {
+				return err
+			}
+			if err := webp.Encode(&webpBuf, img, &webp.Options{Lossless: true}); err != nil {
+				return err
+			}
+			webpReader := bytes.NewReader(webpBuf.Bytes())
+			resizeFileName := controller.bucketPath(conf, fmt.Sprintf("%s_webp%s", fileUID, ".webp"))
+
+			if _, err := controller.bucket.UploadFile(ctx, webpReader, resizeFileName, strings.ReplaceAll(fileHeader.Filename, ext, "")+".webp"); err != nil {
+				return err
+			}
+			return nil
+		})
+	}
+
+	if conf.ThumbnailEnabled {
+		thumbReader := bytes.NewReader(fileByte)
+
+		errGroup.Go(func() error {
+			var thumbBuf bytes.Buffer
+			img, err := controller.getImage(thumbReader, ext)
+			if err != nil {
+				return err
+			}
+			resizeImage := resize.Resize(conf.ThumbnailWidth, 0, img, resize.Lanczos3)
+			if Extension(ext) == JPGFile || Extension(ext) == JPEGFile {
+				if err := jpeg.Encode(&thumbBuf, resizeImage, nil); err != nil {
+					return err
+				}
+			}
+			if Extension(ext) == PNGFile {
+				if err := png.Encode(&thumbBuf, resizeImage); err != nil {
+					return err
+				}
+			}
+			newThumbReader := bytes.NewReader(thumbBuf.Bytes())
+			resizeFileName := controller.bucketPath(conf, fmt.Sprintf("%s_thumb%s", fileUID, ext))
+			_, err = controller.bucket.UploadFile(ctx, newThumbReader, resizeFileName, fileHeader.Filename)
+			if err != nil {
+				return err
+			}
+			return nil
+		})
+
+		if conf.WebpEnabled {
+			webpReader := bytes.NewReader(fileByte)
+			errGroup.Go(func() error {
+				var webpBuf bytes.Buffer
+				img, err := controller.getImage(webpReader, ext)
+				if err != nil {
+					return err
+				}
+
+				resizeImage := resize.Resize(conf.ThumbnailWidth, 0, img, resize.Lanczos3)
+				err = webp.Encode(&webpBuf, resizeImage, &webp.Options{Lossless: true})
+				if err != nil {
+					return err
+				}
+
+				webpReader := bytes.NewReader(webpBuf.Bytes())
+				resizeFileName := controller.bucketPath(conf, fmt.Sprintf("%s_thumb%s", fileUID, ".webp"))
+
+				_, err = controller.bucket.UploadFile(ctx, webpReader, resizeFileName, fileHeader.Filename)
+				if err != nil {
+					return err
+				}
+
+				return nil
+			})
+		}
+
+	}
 	return nil
+}
+
+func (u *uploadController) getImage(file io.Reader, ext string) (image.Image, error) {
+	if Extension(ext) == JPGFile || Extension(ext) == JPEGFile {
+		return jpeg.Decode(file)
+	}
+	if Extension(ext) == PNGFile {
+		return png.Decode(file)
+	}
+	return nil, errors.New("file extension not supported")
 }
 
 func (u *uploadController) randomFileName(c UploadConfig, ext string) (randomName, uid string) {
